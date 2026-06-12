@@ -1,0 +1,187 @@
+require("dotenv").config();
+const path = require("path");
+const express = require("express");
+const http = require("http");
+const rateLimit = require("express-rate-limit");
+const pino = require("pino");
+const pinoHttp = require("pino-http");
+const { Server } = require("socket.io");
+const { createHistoryStore } = require("./history-store");
+
+const logger = pino({ level: process.env.LOG_LEVEL || "info" });
+
+const PORT = Number(process.env.PORT || 3000);
+const HISTORY_LIMIT = Number(process.env.HISTORY_LIMIT || 100);
+const ROOM_NAME_RE = /^[a-zA-Z0-9_-]{1,40}$/;
+const MAX_MESSAGE_BYTES = Number(process.env.MAX_MESSAGE_BYTES || 4 * 1024 * 1024);
+const SOCKET_RATE_LIMIT_COUNT = Number(process.env.SOCKET_RATE_LIMIT_COUNT || 25);
+const SOCKET_RATE_LIMIT_WINDOW_MS = Number(process.env.SOCKET_RATE_LIMIT_WINDOW_MS || 10_000);
+
+const app = express();
+app.set("trust proxy", 1);
+app.use(pinoHttp({ logger }));
+
+app.use(
+  rateLimit({
+    windowMs: Number(process.env.HTTP_RATE_WINDOW_MS || 60_000),
+    max: Number(process.env.HTTP_RATE_MAX || 160),
+    standardHeaders: true,
+    legacyHeaders: false
+  })
+);
+
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: process.env.CORS_ORIGIN || "*",
+    methods: ["GET", "POST"]
+  },
+  maxHttpBufferSize: MAX_MESSAGE_BYTES + 1024
+});
+
+const roomPresence = new Map();
+const socketRateState = new Map();
+let historyStore;
+
+function normalizeRoom(rawRoom) {
+  const candidate = String(rawRoom || "global").trim();
+  return ROOM_NAME_RE.test(candidate) ? candidate : "global";
+}
+
+function safeName(rawName) {
+  const cleaned = String(rawName || "user").trim().slice(0, 24);
+  return cleaned || "user";
+}
+
+function safeAvatar(rawAvatar) {
+  const value = String(rawAvatar || "");
+  if (value.startsWith("data:image/")) return value.slice(0, MAX_MESSAGE_BYTES);
+  if (/^https?:\/\//.test(value)) return value.slice(0, 600);
+  return "https://via.placeholder.com/40";
+}
+
+function sanitizeMessage(payload) {
+  const type = payload?.type === "image" || payload?.type === "audio" ? payload.type : "text";
+  const content = String(payload?.content || "").slice(0, MAX_MESSAGE_BYTES);
+  return { type, content, at: Date.now() };
+}
+
+function getOnlineNames(room) {
+  const users = roomPresence.get(room) || new Map();
+  return [...new Set([...users.values()].map((u) => u.name))].sort();
+}
+
+function emitPresence(room) {
+  io.to(room).emit("presence:update", getOnlineNames(room));
+}
+
+function isSocketRateLimited(socketId) {
+  const now = Date.now();
+  const state = socketRateState.get(socketId) || { resetAt: now + SOCKET_RATE_LIMIT_WINDOW_MS, count: 0 };
+  if (now > state.resetAt) {
+    state.resetAt = now + SOCKET_RATE_LIMIT_WINDOW_MS;
+    state.count = 0;
+  }
+  state.count += 1;
+  socketRateState.set(socketId, state);
+  return state.count > SOCKET_RATE_LIMIT_COUNT;
+}
+
+async function setupSocketHandlers() {
+  io.on("connection", (socket) => {
+    socket.data.room = null;
+    socket.data.profile = { name: "user", avatar: "https://via.placeholder.com/40" };
+
+    socket.on("room:join", async (payload = {}) => {
+      try {
+        const room = normalizeRoom(payload.room);
+        const profile = {
+          name: safeName(payload.name),
+          avatar: safeAvatar(payload.avatar)
+        };
+
+        const prevRoom = socket.data.room;
+        if (prevRoom && prevRoom !== room) {
+          socket.leave(prevRoom);
+          const prevUsers = roomPresence.get(prevRoom);
+          if (prevUsers) {
+            prevUsers.delete(socket.id);
+            if (prevUsers.size === 0) roomPresence.delete(prevRoom);
+          }
+          emitPresence(prevRoom);
+        }
+
+        socket.join(room);
+        socket.data.room = room;
+        socket.data.profile = profile;
+
+        if (!roomPresence.has(room)) roomPresence.set(room, new Map());
+        roomPresence.get(room).set(socket.id, profile);
+
+        const history = await historyStore.getRecent(room);
+        socket.emit("room:history", history);
+        emitPresence(room);
+      } catch (err) {
+        logger.error({ err }, "room:join failed");
+      }
+    });
+
+    socket.on("chat:send", async (payload = {}) => {
+      try {
+        if (isSocketRateLimited(socket.id)) {
+          socket.emit("chat:error", { message: "Too many messages. Slow down." });
+          return;
+        }
+
+        const room = socket.data.room;
+        if (!room) return;
+
+        const msg = sanitizeMessage(payload);
+        if (!msg.content.trim()) return;
+        msg.user = socket.data.profile;
+
+        await historyStore.append(room, msg);
+        io.to(room).emit("chat:message", msg);
+      } catch (err) {
+        logger.error({ err }, "chat:send failed");
+      }
+    });
+
+    socket.on("disconnect", () => {
+      const room = socket.data.room;
+      socketRateState.delete(socket.id);
+      if (!room) return;
+
+      const users = roomPresence.get(room);
+      if (users) {
+        users.delete(socket.id);
+        if (users.size === 0) roomPresence.delete(room);
+      }
+      emitPresence(room);
+    });
+  });
+}
+
+async function start() {
+  historyStore = await createHistoryStore({
+    provider: process.env.HISTORY_PROVIDER || "memory",
+    limit: HISTORY_LIMIT,
+    databaseUrl: process.env.DATABASE_URL,
+    redisUrl: process.env.REDIS_URL,
+    logger
+  });
+
+  await setupSocketHandlers();
+
+  app.use(express.static(path.resolve(__dirname)));
+  app.get("/health", (_, res) => res.json({ ok: true, uptime: Math.floor(process.uptime()) }));
+
+  server.listen(PORT, () => {
+    logger.info({ port: PORT }, "Chat server is running");
+  });
+}
+
+start().catch((err) => {
+  logger.error({ err }, "Failed to start server");
+  process.exit(1);
+});
